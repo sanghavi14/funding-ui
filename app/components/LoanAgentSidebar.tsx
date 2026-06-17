@@ -1,0 +1,466 @@
+"use client";
+
+import React, { useState, useEffect, useRef } from "react";
+import { LoanInformation } from "../types/loan";
+import { Sessions, Agents } from "@osdk/foundry.aipagents";
+
+// Helper to parse double asterisks for bolding
+const parseBoldText = (text: string): React.ReactNode[] => {
+  const parts = text.split(/\*\*([^*]+)\*\*/g);
+  return parts.map((part, idx) => {
+    // Every odd index is bold text
+    if (idx % 2 === 1) {
+      return <strong key={idx} className="font-bold text-[#104281]">{part}</strong>;
+    }
+    return part;
+  });
+};
+
+const renderMessageText = (text: string) => {
+  // Simple markdown helper to convert newlines, bold, bullets, list items, and headers into nice React elements
+  const lines = text.split('\n');
+  return lines.map((line, idx) => {
+    // Handle Headers: e.g. "### Title" or "## Title" or "# Title"
+    if (line.startsWith('#')) {
+      const depth = line.match(/^#+/)?.[0].length || 1;
+      const cleanLine = line.replace(/^#+\s*/, '');
+      const headerClasses = depth === 1 ? "text-sm font-bold text-slate-800 my-1.5 block" 
+                          : depth === 2 ? "text-xs font-bold text-slate-700 my-1 block" 
+                          : "text-xs font-semibold text-slate-600 my-0.5 block";
+      return <span key={idx} className={headerClasses}>{cleanLine}</span>;
+    }
+
+    // Handle bullet list items: e.g. "- item" or "* item"
+    if (line.trim().startsWith('- ') || line.trim().startsWith('* ')) {
+      const cleanLine = line.replace(/^[\s\-\*]+\s*/, '');
+      const content = (
+        <span className="flex items-start gap-1.5 pl-2 my-0.5">
+          <span className="text-[#104281] font-bold select-none">•</span>
+          <span>{parseBoldText(cleanLine)}</span>
+        </span>
+      );
+      return <div key={idx}>{content}</div>;
+    }
+
+    // Standard line with potential bold formatting **text**
+    return (
+      <p key={idx} className="min-h-[1em] mb-1">
+        {parseBoldText(line)}
+      </p>
+    );
+  });
+};
+
+interface Message {
+  id: string;
+  text: string;
+  sender: "user" | "agent";
+  timestamp: Date;
+}
+
+interface LoanAgentSidebarProps {
+  isOpen: boolean;
+  setIsOpen: (isOpen: boolean) => void;
+  activeLoanData?: LoanInformation | null;
+  onSendMessage?: (text: string) => void;
+  client?: any;
+}
+
+const AGENT_RID = "ri.aip-agents..agent.450fd686-fb9f-4d96-a67e-54029a2913d1";
+
+export default function LoanAgentSidebar({
+  isOpen,
+  setIsOpen,
+  activeLoanData,
+  onSendMessage,
+  client,
+}: LoanAgentSidebarProps) {
+  const [inputText, setInputText] = useState("");
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [isTyping, setIsTyping] = useState(false);
+  const [sessionRid, setSessionRid] = useState<string | null>(null);
+  const chatContainerRef = useRef<HTMLDivElement>(null);
+  const chatEndRef = useRef<HTMLDivElement>(null);
+
+  // Auto-scroll the chat container only, preventing page-level scroll shifting
+  useEffect(() => {
+    if (chatContainerRef.current) {
+      chatContainerRef.current.scrollTo({
+        top: chatContainerRef.current.scrollHeight,
+        behavior: "smooth"
+      });
+    }
+  }, [messages, isTyping]);
+
+  const handleSend = async () => {
+    if (!inputText.trim()) return;
+
+    const userText = inputText.trim();
+    setInputText("");
+
+    // Add user message
+    const userMsg: Message = {
+      id: Math.random().toString(36).substring(7),
+      text: userText,
+      sender: "user",
+      timestamp: new Date(),
+    };
+
+    setMessages((prev) => [...prev, userMsg]);
+
+    // Invoke the OSDK/AIP session API handler stub
+    if (onSendMessage) {
+      onSendMessage(userText);
+    }
+
+    setIsTyping(true);
+
+    // If active OSDK client is present, make the real API query call to the Loan Risk Analyzer Agent
+    if (client) {
+      try {
+        const agentRid = AGENT_RID;
+        let activeSessionRid = sessionRid;
+
+        // 1. Create a session if it doesn't already exist in state
+        if (!activeSessionRid) {
+          const session = await Sessions.create(client, agentRid, {}, { preview: true });
+          activeSessionRid = session.rid;
+          setSessionRid(session.rid);
+        }
+
+        // 2. Prepare parameter inputs (passing current loan number as expected by the agent)
+        const parameterInputs: Record<string, any> = {};
+        if (activeLoanData?.loanNumber) {
+          parameterInputs.loanNumber = {
+            type: "string",
+            value: activeLoanData.loanNumber,
+          };
+        }
+
+        // 3. Continue the conversation session with blocking generated answer
+        const exchangeResult = await Sessions.blockingContinue(
+          client,
+          agentRid,
+          activeSessionRid,
+          {
+            userInput: { text: userText },
+            parameterInputs: parameterInputs,
+          },
+          { preview: true }
+        );
+
+        // 4. Retrieve markdown answer
+        const replyText = exchangeResult.agentMarkdownResponse || "No response generated by the agent.";
+
+        const agentMsg: Message = {
+          id: Math.random().toString(36).substring(7),
+          text: replyText,
+          sender: "agent",
+          timestamp: new Date(),
+        };
+
+        setMessages((prev) => [...prev, agentMsg]);
+      } catch (error: any) {
+        console.error("OSDK AIP Agent failure:", error);
+        
+        let detailMessage = error.message || "Unknown error";
+        if (error.errorName) {
+          detailMessage = `${error.errorName} (${error.statusCode || 400}): ${error.errorDescription || "Bad Request"}`;
+        }
+        
+        const errorMsg: Message = {
+          id: Math.random().toString(36).substring(7),
+          text: `⚠️ Error executing Loan Risk Analyzer Agent: ${detailMessage}. Please ensure your session is active.`,
+          sender: "agent",
+          timestamp: new Date(),
+        };
+        setMessages((prev) => [...prev, errorMsg]);
+      } finally {
+        setIsTyping(false);
+      }
+      return;
+    }
+
+    // FALLBACK: Premium simulated response in local development mock mode
+    setTimeout(() => {
+      setIsTyping(false);
+      let replyText = "";
+
+      const query = userText.toLowerCase();
+
+      if (activeLoanData) {
+        if (query.includes("status")) {
+          replyText = `The current status of Loan #${activeLoanData.loanNumber} is "${activeLoanData.loanStatus}".`;
+        } else if (query.includes("borrower") || query.includes("client") || query.includes("name")) {
+          replyText = `The borrower(s) listed on this loan is ${activeLoanData.borrowerName || "N/A"}.`;
+        } else if (query.includes("amount") || query.includes("size") || query.includes("value")) {
+          replyText = `The total loan amount is ${activeLoanData.loanAmount || "N/A"}.`;
+        } else if (query.includes("rate") || query.includes("interest")) {
+          replyText = `The interest rate is currently ${activeLoanData.interestRate || "N/A"}% with a ${activeLoanData.product || "N/A"} product.`;
+        } else if (query.includes("address") || query.includes("property") || query.includes("location")) {
+          replyText = `The property is located at: ${activeLoanData.propertyAddress || "N/A"}.`;
+        } else if (query.includes("rework") || query.includes("problem") || query.includes("issue")) {
+          const rework = activeLoanData.fundingReworkTI;
+          if (rework && rework.toLowerCase() !== "no") {
+            replyText = `Warning: There is a pending Funding Rework task for this loan ("${rework}"). This requires immediate verification of the closing documents.`;
+          } else {
+            replyText = `All clear! There are no outstanding Funding Rework tracking items listed for this loan.`;
+          }
+        } else if (query.includes("closing") || query.includes("date")) {
+          replyText = `The scheduled closing date is ${activeLoanData.scheduledClosingDate || "N/A"}, and the scheduled disbursement date is ${activeLoanData.scheduledDisbursementDate || "N/A"}.`;
+        } else if (query.includes("agent") || query.includes("closing agent")) {
+          replyText = `The assigned closing agent is ${activeLoanData.closingAgent || "N/A"}.`;
+        } else {
+          replyText = `I've analyzed Loan #${activeLoanData.loanNumber} for ${activeLoanData.borrowerName}. What specific risk assessment, static info, or escrow payoffs would you like to review? You can ask about status, interest rate, borrower, address, or outstanding rework issues.`;
+        }
+      } else {
+        replyText = "Hello! I am the Loan Risk Analyzer Agent. Please search for and load a loan in the main dashboard panel first, so I can analyze its details and answer your questions.";
+      }
+
+      const agentMsg: Message = {
+        id: Math.random().toString(36).substring(7),
+        text: replyText,
+        sender: "agent",
+        timestamp: new Date(),
+      };
+
+      setMessages((prev) => [...prev, agentMsg]);
+    }, 1200);
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  };
+
+  const clearChat = () => {
+    setMessages([]);
+  };
+
+  // 1. COLLAPSED VIEW (Image 2)
+  if (!isOpen) {
+    return (
+      <div
+        onClick={() => setIsOpen(true)}
+        className="w-[50px] h-[calc(100vh-140px)] sticky top-[20px] flex flex-col items-center bg-slate-50 border border-slate-200 shadow-sm rounded-md cursor-pointer hover:bg-slate-100/70 transition-all duration-300 select-none group relative shrink-0"
+        title="Expand Loan Agent Panel"
+      >
+        {/* Top Menu Icon Button */}
+        <div className="pt-4 pb-6 flex items-center justify-center shrink-0">
+          <button className="p-1 rounded hover:bg-slate-200/60 transition-colors cursor-pointer group-hover:scale-105 duration-200">
+            <svg className="w-5 h-5 text-[#104281]" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+              {/* Three horizontal lines */}
+              <path strokeLinecap="round" strokeLinejoin="round" d="M3 6h11M3 12h11M3 18h11" />
+              {/* Right chevron */}
+              <path strokeLinecap="round" strokeLinejoin="round" d="M17 8l4 4-4 4" />
+            </svg>
+          </button>
+        </div>
+
+        {/* Vertical Text Orientation: reads "LOAN AGENT" bottom-to-top, perfectly centered, preventing clipping */}
+        <div className="absolute top-[110px] left-0 right-0 flex items-center justify-center">
+          <span
+            className="whitespace-nowrap text-[11px] font-bold tracking-widest text-[#104281] uppercase select-none font-sans"
+            style={{ transform: "rotate(-90deg)" }}
+          >
+            Loan Agent
+          </span>
+        </div>
+      </div>
+    );
+  }
+
+  // 2. EXPANDED VIEW (Image 1)
+  return (
+    <div className="w-[320px] md:w-[350px] lg:w-[28%] h-[calc(100vh-140px)] sticky top-[20px] flex flex-col bg-[#f8f9fa] border border-slate-200 shadow-sm rounded-md overflow-hidden transition-all duration-300 font-sans shrink-0">
+      {/* Header Bar: Pixel-perfect match with StaticInformation */}
+      <div className="bg-[#104281] text-white h-10 flex justify-between items-center px-4 select-none shrink-0 border-b border-blue-900/20">
+        <div className="flex items-center">
+          <span className="text-[13px] font-semibold tracking-wide font-sans">Loan Agent</span>
+        </div>
+        {/* Toggle/Collapse back Button */}
+        <button
+          onClick={() => setIsOpen(false)}
+          className="p-1 rounded hover:bg-white/10 text-white transition-colors cursor-pointer flex items-center justify-center"
+          title="Collapse Panel"
+        >
+          <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+            {/* Three horizontal lines */}
+            <path strokeLinecap="round" strokeLinejoin="round" d="M10 6h11M10 12h11M10 18h11" />
+            {/* Left chevron */}
+            <path strokeLinecap="round" strokeLinejoin="round" d="M7 8l-4 4 4 4" />
+          </svg>
+        </button>
+      </div>
+
+      {/* Top Right Action Sub-bar */}
+      <div className="bg-white border-b border-slate-200 px-3 py-1.5 flex justify-between items-center shrink-0">
+        {/* Left Side Subbar Icons */}
+        <div className="flex items-center space-x-2.5">
+          <button
+            onClick={clearChat}
+            className="p-1.5 rounded hover:bg-slate-100 text-slate-500 hover:text-slate-700 transition-colors"
+            title="Start New Session (+)"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
+            </svg>
+          </button>
+          <button
+            className="p-1.5 rounded hover:bg-slate-100 text-slate-400 hover:text-slate-600 transition-colors"
+            title="Download Session History"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <circle cx="12" cy="12" r="10" />
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 8v8m0 0l-3-3m3 3l3-3" />
+            </svg>
+          </button>
+        </div>
+
+        {/* Right Side Subbar Icons */}
+        <div className="flex items-center space-x-1.5">
+          <button className="p-1.5 rounded hover:bg-slate-100 text-slate-400 hover:text-slate-600 transition-colors" title="Thumbs Up">
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M14 9V5a3 3 0 00-3-3l-4 9v11h11.28a2 2 0 002-1.7l1.38-9a2 2 0 00-2-2.3zM7 22H4a2 2 0 01-2-2v-7a2 2 0 012-2h3" />
+            </svg>
+          </button>
+          <button className="p-1.5 rounded hover:bg-slate-100 text-slate-400 hover:text-slate-600 transition-colors" title="Thumbs Down">
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M10 15v4a3 3 0 003 3l4-9V2H5.72a2 2 0 00-2 1.7l-1.38 9a2 2 0 002 2.3zm12-7h3a2 2 0 012 2v7a2 2 0 01-2 2h-3" />
+            </svg>
+          </button>
+          <button className="p-1.5 rounded hover:bg-slate-100 text-slate-400 hover:text-slate-600 transition-colors" title="Info Panel">
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      {/* Main Panel Content Area */}
+      <div ref={chatContainerRef} className="flex-grow overflow-y-auto p-4 flex flex-col bg-white">
+        {messages.length === 0 ? (
+          /* Empty State - Subtle Robot Icon in Center */
+          <div className="flex-grow flex flex-col items-center justify-center select-none py-12">
+            <div className="w-14 h-14 rounded-full bg-slate-50 flex items-center justify-center border border-slate-100 shadow-sm mb-3">
+              <svg className="w-7 h-7 text-slate-400/90" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+                <rect x="3" y="11" width="18" height="10" rx="2" />
+                <circle cx="8.5" cy="15.5" r="1.25" fill="currentColor" />
+                <circle cx="15.5" cy="15.5" r="1.25" fill="currentColor" />
+                <path d="M8 7v4" strokeLinecap="round" />
+                <path d="M16 7v4" strokeLinecap="round" />
+                <path d="M12 3v4" strokeLinecap="round" />
+                <circle cx="12" cy="3" r="1" fill="currentColor" />
+                <path d="M10 19h4" strokeLinecap="round" />
+              </svg>
+            </div>
+            <h3 className="text-sm font-semibold text-slate-600 tracking-wide text-center">
+              Loan Risk Analyzer Agent
+            </h3>
+            {activeLoanData && (
+              <p className="text-[11px] text-slate-400 mt-1 max-w-[200px] text-center leading-relaxed">
+                Ask me details about Loan #{activeLoanData.loanNumber} for {activeLoanData.borrowerName}.
+              </p>
+            )}
+          </div>
+        ) : (
+          /* Chat Message Log List */
+          <div className="space-y-3 flex-grow pb-4">
+            {messages.map((msg) => (
+              <div
+                key={msg.id}
+                className={`flex ${msg.sender === "user" ? "justify-end" : "justify-start"} animate-fadeIn`}
+              >
+                {msg.sender === "agent" && (
+                  <div className="w-6 h-6 rounded-full bg-[#104281]/10 flex items-center justify-center shrink-0 mr-1.5 mt-0.5 border border-[#104281]/20">
+                    <svg className="w-3.5 h-3.5 text-[#104281]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <rect x="3" y="11" width="18" height="10" rx="1.5" />
+                      <circle cx="8.5" cy="16" r="0.75" fill="currentColor" />
+                      <circle cx="15.5" cy="16" r="0.75" fill="currentColor" />
+                      <path d="M12 7v4" strokeLinecap="round" />
+                    </svg>
+                  </div>
+                )}
+                <div
+                  className={`max-w-[85%] rounded-lg px-3.5 py-2 text-xs leading-relaxed shadow-sm ${msg.sender === "user"
+                    ? "bg-slate-100 text-slate-800 rounded-tr-none font-medium border border-slate-200"
+                    : "bg-[#104281]/5 text-slate-700 rounded-tl-none border border-[#104281]/10"
+                    }`}
+                >
+                  {renderMessageText(msg.text)}
+                </div>
+              </div>
+            ))}
+
+            {/* Simulated Typing Indicator */}
+            {isTyping && (
+              <div className="flex justify-start items-center animate-pulse">
+                <div className="w-6 h-6 rounded-full bg-[#104281]/10 flex items-center justify-center shrink-0 mr-1.5 border border-[#104281]/20">
+                  <svg className="w-3.5 h-3.5 text-[#104281]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <rect x="3" y="11" width="18" height="10" rx="1.5" />
+                  </svg>
+                </div>
+                <div className="bg-[#104281]/5 border border-[#104281]/10 rounded-lg rounded-tl-none px-3.5 py-2.5 flex items-center space-x-1.5">
+                  <div className="w-1.5 h-1.5 bg-[#104281] rounded-full animate-bounce" style={{ animationDelay: "0ms" }}></div>
+                  <div className="w-1.5 h-1.5 bg-[#104281] rounded-full animate-bounce" style={{ animationDelay: "150ms" }}></div>
+                  <div className="w-1.5 h-1.5 bg-[#104281] rounded-full animate-bounce" style={{ animationDelay: "300ms" }}></div>
+                </div>
+              </div>
+            )}
+            <div ref={chatEndRef} />
+          </div>
+        )}
+      </div>
+
+      {/* Sticky Message Box Input Container at bottom */}
+      <div className="p-3 bg-white border-t border-slate-200/90 shrink-0">
+        <div className="border border-slate-300/90 hover:border-slate-400 focus-within:border-blue-500/80 rounded-lg p-2.5 bg-slate-50/20 shadow-inner flex flex-col transition-colors min-h-[96px]">
+          <textarea
+            placeholder="Ask a question..."
+            value={inputText}
+            onChange={(e) => setInputText(e.target.value)}
+            onKeyDown={handleKeyDown}
+            className="w-full flex-grow text-xs text-slate-800 placeholder-slate-400 focus:outline-none bg-transparent resize-none leading-relaxed h-[52px] scrollbar-thin"
+          />
+          <div className="flex justify-between items-center mt-1 pt-1.5 border-t border-slate-100">
+            {/* Bottom-left: Rounded "+" sign inside bottom-left corner */}
+            <button
+              className="w-5 h-5 rounded-full border border-slate-300 hover:border-slate-400 hover:bg-slate-100 flex items-center justify-center text-slate-500 transition-all shrink-0 cursor-pointer"
+              title="Add attachment"
+            >
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
+              </svg>
+            </button>
+            {/* Bottom-right: Microphone and Send arrow button */}
+            <div className="flex items-center space-x-2.5 shrink-0">
+              <button
+                className="text-slate-400 hover:text-slate-600 transition-colors p-0.5 cursor-pointer"
+                title="Voice Input"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2.2" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+                </svg>
+              </button>
+              <button
+                onClick={handleSend}
+                disabled={!inputText.trim()}
+                className={`p-1 rounded transition-all flex items-center justify-center shrink-0 cursor-pointer ${inputText.trim()
+                  ? "text-[#1F4E9E] hover:text-blue-700 hover:scale-105"
+                  : "text-slate-300 cursor-not-allowed"
+                  }`}
+                title="Send Message"
+              >
+                <svg className="w-4 h-4 transform rotate-0" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 12L3.269 3.126A59.768 59.768 0 0121.485 12 59.77 59.77 0 013.27 20.876L5.999 12zm0 0h7.5" />
+                </svg>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
